@@ -28,15 +28,15 @@ class TinymalRoughCfg(LeggedRobotCfg):
         send_timeouts = True
 
     class terrain(LeggedRobotCfg.terrain):
-        mesh_type = 'plane'        # 【用户约束】平地训练
+        mesh_type = 'trimesh'      # 楼梯+平地（legged_robot.py 已补 trimesh 全局地形加载）
         horizontal_scale = 0.1
         vertical_scale = 0.005
         border_size = 25
-        curriculum = True          # plane 模式下地形课程不生效，保留无碍
+        curriculum = True          # 生成课程地形(难度按行递增)；不做自动升降级，靠 reset 随机换块覆盖
         static_friction = 1.0
         dynamic_friction = 1.0
         restitution = 0.
-        measure_heights = False    # 平地不需要高度图（原版 obs 不含高度，此项仅影响随机化等）
+        measure_heights = False    # 原版 obs 固定48维不含高度图→盲走；此 flag 在本框架为死参数
         measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
         selected = False
@@ -48,8 +48,8 @@ class TinymalRoughCfg(LeggedRobotCfg):
         num_cols = 20
         # proportions 语义（cumsum 后按 choice 区间划分地形类型）：
         #   [0]=平地(terrain.py 已改为生成平地), [1]=粗糙坡, [2]/[3]=楼梯(下/上), [4]=离散障碍
-        # [0.5, 0.0, 0.25, 0.25, 0.0] → 50% 平地 + 25% 下楼梯 + 25% 上楼梯，无坡无障碍
-        terrain_proportions = [0.5, 0.0, 0.25, 0.25, 0.0]
+        # [0.7, 0.0, 0.15, 0.15, 0.0] → 70% 平地 + 15% 下楼梯 + 15% 上楼梯（平地为主，降低起步难度）
+        terrain_proportions = [0.7, 0.0, 0.15, 0.15, 0.0]
         slope_treshold = 0.75
 
     class commands(LeggedRobotCfg.commands):
@@ -60,9 +60,9 @@ class TinymalRoughCfg(LeggedRobotCfg):
         heading_command = False
 
         class ranges:
-            lin_vel_x = [-1.0, 1.0]    # 【用户约束】最高 1 m/s
-            lin_vel_y = [-1.0, 1.0]
-            ang_vel_yaw = [-1.0, 1.0]
+            lin_vel_x = [-0.6, 0.6]    # 楼梯上降速，避免高速摔倒
+            lin_vel_y = [-0.4, 0.4]    # 侧向降速
+            ang_vel_yaw = [-0.6, 0.6]  # 转向降速
             heading = [-3.14, 3.14]
 
     class init_state(LeggedRobotCfg.init_state):
@@ -127,11 +127,11 @@ class TinymalRoughCfg(LeggedRobotCfg):
         # 仅保留原版 LeggedRobot 实际读取的随机化项；
         # Trot 里的 link_mass/base_com/pd_gains/motor_offset/latency 等需自定义 env，已剔除。
         randomize_friction = True
-        friction_range = [0.2, 1.2]
+        friction_range = [0.5, 1.5]   # 0.2 太滑，楼梯边缘打滑必摔；提高下限
 
         push_robots = True
-        push_interval_s = 4
-        max_push_vel_xy = 0.4
+        push_interval_s = 6           # 楼梯边缘被推下风险大，降低推力频率
+        max_push_vel_xy = 0.3         # 减弱推力幅度
 
         # 按整机质量比例缩放(5.664/15.019≈0.377)。原版字段名为 added_mass_range。
         randomize_base_mass = True
@@ -140,7 +140,7 @@ class TinymalRoughCfg(LeggedRobotCfg):
     class rewards(LeggedRobotCfg.rewards):
         class scales(LeggedRobotCfg.rewards.scales):
             # 主要奖励（轻小机器人加强跟踪与姿态稳定）
-            tracking_lin_vel = 3.5
+            tracking_lin_vel = 2.5
             tracking_ang_vel = 1.5
             # 轻机器人转动惯量小，同扰动影响更大，加强姿态稳定惩罚
             lin_vel_z = -1.5
@@ -153,16 +153,16 @@ class TinymalRoughCfg(LeggedRobotCfg):
             collision = -0.5               # 腿更短更细，碰撞危害小，放松
             action_rate = -0.02
             stand_still = -1.0
-            base_height = -1.
+            base_height = -0.5
             # 鼓励抬脚形成 trot 步态（原版支持；Trot 配置用自定义 trot 奖励替代，此处用 feet_air_time 补位）
-            feet_air_time = 1.0
+            feet_air_time = 1.5
             # 删除项（原版无对应 _reward_ 函数，配置会报错）：
             #   trot / gallop / energy_consumption / feet_clearance /
             #   default_hip_pos / default_pos / contact_without_command / alive
 
         only_positive_rewards = False
         tracking_sigma = 0.25
-        soft_dof_pos_limit = 0.9
+        soft_dof_pos_limit = 0.95       # 高抬腿需更大关节活动范围
         soft_dof_vel_limit = 1.
         soft_torque_limit = 1.
         base_height_target = 0.20         # = FK 站立高度 0.195，惩罚设在自然站立点

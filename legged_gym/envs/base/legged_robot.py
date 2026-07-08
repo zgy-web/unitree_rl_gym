@@ -16,6 +16,7 @@ from legged_gym.envs.base.base_task import BaseTask
 from legged_gym.utils.math import wrap_to_pi
 from legged_gym.utils.isaacgym_utils import get_euler_xyz as get_euler_xyz_in_tensor
 from legged_gym.utils.helpers import class_to_dict
+from legged_gym.utils.terrain import Terrain
 from .legged_robot_config import LeggedRobotCfg
 
 class LeggedRobot(BaseTask):
@@ -35,6 +36,8 @@ class LeggedRobot(BaseTask):
         self.cfg = cfg
         self.sim_params = sim_params
         self.height_samples = None
+        self.terrain = None
+        self.terrain_origins = None
         self.debug_viz = False
         self.init_done = False
         self._parse_cfg(self.cfg)
@@ -354,6 +357,10 @@ class LeggedRobot(BaseTask):
         # base position
         if self.custom_origins:
             self.root_states[env_ids] = self.base_init_state
+            # 每次 reset 随机换一个地形块（覆盖所有难度，不做课程升降级）
+            rows = torch.randint(0, self.cfg.terrain.num_rows, (len(env_ids),), device=self.device)
+            cols = torch.randint(0, self.cfg.terrain.num_cols, (len(env_ids),), device=self.device)
+            self.env_origins[env_ids] = self.terrain_origins[rows, cols]
             self.root_states[env_ids, :3] += self.env_origins[env_ids]
             self.root_states[env_ids, :2] += torch_rand_float(-1., 1., (len(env_ids), 2), device=self.device) # xy position within 1m of the center
         else:
@@ -508,14 +515,47 @@ class LeggedRobot(BaseTask):
                              for name in self.reward_scales.keys()}
 
     def _create_ground_plane(self):
-        """ Adds a ground plane to the simulation, sets friction and restitution based on the cfg.
+        """ Adds ground to the simulation. trimesh/heightfield → 全局地形网格；plane → 无限大平地。
+            必须在 gym.prepare_sim 之前调用（本方法由 create_sim 调用，满足）。
         """
-        plane_params = gymapi.PlaneParams()
-        plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
-        plane_params.static_friction = self.cfg.terrain.static_friction
-        plane_params.dynamic_friction = self.cfg.terrain.dynamic_friction
-        plane_params.restitution = self.cfg.terrain.restitution
-        self.gym.add_ground(self.sim, plane_params)
+        mesh_type = self.cfg.terrain.mesh_type
+        if mesh_type in ['trimesh', 'heightfield']:
+            self.terrain = Terrain(self.cfg.terrain, self.num_envs)
+            self.custom_origins = True
+            # 地形块平台中心 (num_rows, num_cols, 3) → tensor，供 reset 随机采样
+            self.terrain_origins = torch.tensor(self.terrain.env_origins, device=self.device, dtype=torch.float)
+            if mesh_type == 'trimesh':
+                tm_params = gymapi.TriangleMeshParams()
+                tm_params.nb_vertices = self.terrain.vertices.shape[0]
+                tm_params.nb_triangles = self.terrain.triangles.shape[0]
+                tm_params.static_friction = self.cfg.terrain.static_friction
+                tm_params.dynamic_friction = self.cfg.terrain.dynamic_friction
+                tm_params.restitution = self.cfg.terrain.restitution
+                self.gym.add_triangle_mesh(self.sim,
+                                           self.terrain.vertices.flatten(),
+                                           self.terrain.triangles.flatten(),
+                                           tm_params)
+            else:  # heightfield
+                hf_params = gymapi.HeightFieldParams()
+                hf_params.row_scale = self.cfg.terrain.horizontal_scale
+                hf_params.column_scale = self.cfg.terrain.horizontal_scale
+                hf_params.vertical_scale = self.cfg.terrain.vertical_scale
+                hf_params.nbRows = self.terrain.height_field_raw.shape[0]      # 驼峰命名
+                hf_params.nbColumns = self.terrain.height_field_raw.shape[1]
+                hf_params.static_friction = self.cfg.terrain.static_friction
+                hf_params.dynamic_friction = self.cfg.terrain.dynamic_friction
+                hf_params.restitution = self.cfg.terrain.restitution
+                self.gym.add_heightfield(self.sim,
+                                         self.terrain.height_field_raw.T.flatten(),  # 转置→列优先
+                                         hf_params)
+        else:
+            self.custom_origins = False
+            plane_params = gymapi.PlaneParams()
+            plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
+            plane_params.static_friction = self.cfg.terrain.static_friction
+            plane_params.dynamic_friction = self.cfg.terrain.dynamic_friction
+            plane_params.restitution = self.cfg.terrain.restitution
+            self.gym.add_ground(self.sim, plane_params)
 
     def _create_envs(self):
         """ Creates environments:
@@ -605,20 +645,24 @@ class LeggedRobot(BaseTask):
             self.termination_contact_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], termination_contact_names[i])
 
     def _get_env_origins(self):
-        """ Sets environment origins. On rough terrain the origins are defined by the terrain platforms.
-            Otherwise create a grid.
+        """ Sets environment origins. On rough terrain the origins are sampled from terrain platforms.
+            Otherwise create a grid. custom_origins 由 _create_ground_plane 按地形类型设定。
         """
-      
-        self.custom_origins = False
         self.env_origins = torch.zeros(self.num_envs, 3, device=self.device, requires_grad=False)
-        # create a grid of robots
-        num_cols = np.floor(np.sqrt(self.num_envs))
-        num_rows = np.ceil(self.num_envs / num_cols)
-        xx, yy = torch.meshgrid(torch.arange(num_rows), torch.arange(num_cols))
-        spacing = self.cfg.env.env_spacing
-        self.env_origins[:, 0] = spacing * xx.flatten()[:self.num_envs]
-        self.env_origins[:, 1] = spacing * yy.flatten()[:self.num_envs]
-        self.env_origins[:, 2] = 0.
+        if self.custom_origins:
+            # trimesh/heightfield: 每个 env 随机分配一个地形块的平台中心
+            rows = torch.randint(0, self.cfg.terrain.num_rows, (self.num_envs,), device=self.device)
+            cols = torch.randint(0, self.cfg.terrain.num_cols, (self.num_envs,), device=self.device)
+            self.env_origins[:] = self.terrain_origins[rows, cols]
+        else:
+            # plane: 网格 z=0
+            num_cols = np.floor(np.sqrt(self.num_envs))
+            num_rows = np.ceil(self.num_envs / num_cols)
+            xx, yy = torch.meshgrid(torch.arange(num_rows), torch.arange(num_cols))
+            spacing = self.cfg.env.env_spacing
+            self.env_origins[:, 0] = spacing * xx.flatten()[:self.num_envs]
+            self.env_origins[:, 1] = spacing * yy.flatten()[:self.num_envs]
+            self.env_origins[:, 2] = 0.
 
     def _parse_cfg(self, cfg):
         self.dt = self.cfg.control.decimation * self.sim_params.dt
