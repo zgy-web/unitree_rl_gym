@@ -90,9 +90,10 @@ class Terrain:
         gap_size = 1. * difficulty
         pit_depth = 1. * difficulty
         if choice < self.proportions[0]:
-            if choice < self.proportions[0]/ 2:
-                slope *= -1
-            terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.)
+            # 平地：保持 height_field_raw 全 0，不生成任何起伏。
+            # （原为平滑坡 pyramid_sloped_terrain；现 proportions[0] 表示平地占比。
+            #  仅影响 mesh_type=trimesh/heightfield 的机器人；默认 plane 的 go2/g1/h1 不受影响。）
+            pass
         elif choice < self.proportions[1]:
             terrain_utils.pyramid_sloped_terrain(terrain, slope=slope, platform_size=3.)
             terrain_utils.random_uniform_terrain(terrain, min_height=-0.05, max_height=0.05, step=0.005, downsampled_scale=0.2)

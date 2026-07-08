@@ -46,7 +46,10 @@ class TinymalRoughCfg(LeggedRobotCfg):
         terrain_width = 8.
         num_rows = 10
         num_cols = 20
-        terrain_proportions = [0., 0., 1.0, 0.0, 0.0]
+        # proportions 语义（cumsum 后按 choice 区间划分地形类型）：
+        #   [0]=平地(terrain.py 已改为生成平地), [1]=粗糙坡, [2]/[3]=楼梯(下/上), [4]=离散障碍
+        # [0.5, 0.0, 0.25, 0.25, 0.0] → 50% 平地 + 25% 下楼梯 + 25% 上楼梯，无坡无障碍
+        terrain_proportions = [0.5, 0.0, 0.25, 0.25, 0.0]
         slope_treshold = 0.75
 
     class commands(LeggedRobotCfg.commands):
