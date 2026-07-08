@@ -160,3 +160,6 @@ cython_debug/
 
 # logs
 logs
+
+# 本地参考配置（参数已移植到 legged_gym/envs/tinymal/，保留作个人参考，不纳入版本控制）
+TINYMAL_Trot_config.py
