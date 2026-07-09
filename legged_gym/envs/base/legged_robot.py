@@ -13,7 +13,7 @@ from typing import Tuple, Dict
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.base.base_task import BaseTask
-from legged_gym.utils.math import wrap_to_pi
+from legged_gym.utils.math import wrap_to_pi, quat_apply_yaw
 from legged_gym.utils.isaacgym_utils import get_euler_xyz as get_euler_xyz_in_tensor
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.terrain import Terrain
@@ -194,6 +194,10 @@ class LeggedRobot(BaseTask):
                                     self.actions
                                     ),dim=-1)
         # add perceptive inputs if not blind
+        if self.cfg.terrain.measure_heights:
+            heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5
+                                 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements
+            self.obs_buf = torch.cat((self.obs_buf, heights), dim=-1)
         # add noise if needed
         if self.add_noise:
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
@@ -291,6 +295,9 @@ class LeggedRobot(BaseTask):
             forward = quat_apply(self.base_quat, self.forward_vec)
             heading = torch.atan2(forward[:, 1], forward[:, 0])
             self.commands[:, 2] = torch.clip(0.5*wrap_to_pi(self.commands[:, 3] - heading), -1., 1.)
+        # 采样前方地形高度图（obs 末尾 187 维）
+        if self.cfg.terrain.measure_heights:
+            self.measured_heights = self._get_heights()
 
     def _resample_commands(self, env_ids):
         """ Randommly select commands of some environments
@@ -423,6 +430,11 @@ class LeggedRobot(BaseTask):
         noise_vec[12:12+self.num_actions] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
         noise_vec[12+self.num_actions:12+2*self.num_actions] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
         noise_vec[12+2*self.num_actions:12+3*self.num_actions] = 0. # previous actions
+        # 高度图噪声切片（obs 第 48 维起；直接用配置算点数，不依赖 _init_buffers 的 num_height_points）
+        if self.cfg.terrain.measure_heights:
+            n_h = len(self.cfg.terrain.measured_points_x) * len(self.cfg.terrain.measured_points_y)
+            noise_vec[48:48 + n_h] = (
+                noise_scales.height_measurements * noise_level * self.obs_scales.height_measurements)
 
         return noise_vec
 
@@ -468,7 +480,11 @@ class LeggedRobot(BaseTask):
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
-      
+
+        # 高度图采样点缓冲（num_envs, 187, 3）+ 测量结果占位
+        if self.cfg.terrain.measure_heights:
+            self.height_points = self._init_height_points()
+            self.measured_heights = 0
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -531,6 +547,10 @@ class LeggedRobot(BaseTask):
                 tm_params.static_friction = self.cfg.terrain.static_friction
                 tm_params.dynamic_friction = self.cfg.terrain.dynamic_friction
                 tm_params.restitution = self.cfg.terrain.restitution
+                # 平移 -border_size：让 height_field_raw[border+r,border+c] 对应世界(r*hs,c*hs)，
+                # 使 _get_heights 格点索引正确（否则查表偏移 border_size 全错）
+                tm_params.transform.p.x = -self.terrain.cfg.border_size
+                tm_params.transform.p.y = -self.terrain.cfg.border_size
                 self.gym.add_triangle_mesh(self.sim,
                                            self.terrain.vertices.flatten(),
                                            self.terrain.triangles.flatten(),
@@ -545,9 +565,14 @@ class LeggedRobot(BaseTask):
                 hf_params.static_friction = self.cfg.terrain.static_friction
                 hf_params.dynamic_friction = self.cfg.terrain.dynamic_friction
                 hf_params.restitution = self.cfg.terrain.restitution
+                hf_params.transform.p.x = -self.terrain.cfg.border_size
+                hf_params.transform.p.y = -self.terrain.cfg.border_size
                 self.gym.add_heightfield(self.sim,
                                          self.terrain.height_field_raw.T.flatten(),  # 转置→列优先
                                          hf_params)
+            # 存高度场张量供 _get_heights 查表（trimesh/heightfield 共用）
+            self.height_samples = torch.tensor(self.terrain.heightsamples).view(
+                self.terrain.tot_rows, self.terrain.tot_cols).to(self.device)
         else:
             self.custom_origins = False
             plane_params = gymapi.PlaneParams()
@@ -664,6 +689,33 @@ class LeggedRobot(BaseTask):
             self.env_origins[:, 1] = spacing * yy.flatten()[:self.num_envs]
             self.env_origins[:, 2] = 0.
 
+    def _init_height_points(self):
+        """ 生成本地点云(measured_points 网格, base 系, z=0)，返回 (num_envs, 187, 3) """
+        y = torch.tensor(self.cfg.terrain.measured_points_y, device=self.device, requires_grad=False)
+        x = torch.tensor(self.cfg.terrain.measured_points_x, device=self.device, requires_grad=False)
+        grid_x, grid_y = torch.meshgrid(x, y)
+        self.num_height_points = grid_x.numel()            # 17×11 = 187
+        points = torch.zeros(self.num_envs, self.num_height_points, 3, device=self.device, requires_grad=False)
+        points[:, :, 0] = grid_x.flatten()
+        points[:, :, 1] = grid_y.flatten()
+        return points
+
+    def _get_heights(self, env_ids=None):
+        """ 查表得到前方 num_height_points 个点的地形海拔(米)。无 ray-cast，直接索引 height_samples 张量。 """
+        if self.cfg.terrain.mesh_type == 'plane':
+            return torch.zeros(self.num_envs, self.num_height_points, device=self.device, requires_grad=False)
+        points = quat_apply_yaw(self.base_quat.repeat(1, self.num_height_points),
+                                self.height_points) + (self.root_states[:, :3]).unsqueeze(1)
+        points += self.terrain.cfg.border_size
+        points = (points / self.terrain.cfg.horizontal_scale).long()
+        px = torch.clip(points[:, :, 0].view(-1), 0, self.height_samples.shape[0] - 2)
+        py = torch.clip(points[:, :, 1].view(-1), 0, self.height_samples.shape[1] - 2)
+        heights1 = self.height_samples[px, py]
+        heights2 = self.height_samples[px + 1, py]
+        heights3 = self.height_samples[px, py + 1]
+        heights = torch.min(torch.min(heights1, heights2), heights3)
+        return heights.view(self.num_envs, -1) * self.terrain.cfg.vertical_scale
+
     def _parse_cfg(self, cfg):
         self.dt = self.cfg.control.decimation * self.sim_params.dt
         self.obs_scales = self.cfg.normalization.obs_scales
@@ -691,8 +743,11 @@ class LeggedRobot(BaseTask):
         return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
 
     def _reward_base_height(self):
-        # Penalize base height away from target
-        base_height = self.root_states[:, 2]
+        # Penalize base height away from target（相对前方地形高度：上楼时 base 与地形同升，不被误惩）
+        if self.cfg.terrain.measure_heights:
+            base_height = self.root_states[:, 2] - self.measured_heights.mean(dim=1)
+        else:
+            base_height = self.root_states[:, 2]
         return torch.square(base_height - self.cfg.rewards.base_height_target)
     
     def _reward_torques(self):

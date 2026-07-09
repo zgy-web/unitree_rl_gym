@@ -20,7 +20,7 @@ class TinymalRoughCfg(LeggedRobotCfg):
         # 原版 LeggedRobot.compute_observations 固定返回 48 维：
         # base_lin_vel(3)+base_ang_vel(3)+projected_gravity(3)+commands(3)+dof_pos(12)+dof_vel(12)+actions(12)
         # Trot 配置的 frame_stack*47=470 需自定义 env，原版不支持，故保持 48。
-        num_observations = 48
+        num_observations = 235       # 48 基础 + 187 高度图采样点(17×11)，机器狗能"看见"前方地形
         num_privileged_obs = None
         num_actions = 12
         episode_length_s = 24      # Trot 原值
@@ -36,7 +36,7 @@ class TinymalRoughCfg(LeggedRobotCfg):
         static_friction = 1.0
         dynamic_friction = 1.0
         restitution = 0.
-        measure_heights = False    # 原版 obs 固定48维不含高度图→盲走；此 flag 在本框架为死参数
+        measure_heights = True     # 启用高度图观测：legged_robot.py 已移植 _get_heights 查表
         measured_points_x = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
         measured_points_y = [-0.5, -0.4, -0.3, -0.2, -0.1, 0., 0.1, 0.2, 0.3, 0.4, 0.5]
         selected = False
@@ -60,9 +60,9 @@ class TinymalRoughCfg(LeggedRobotCfg):
         heading_command = False
 
         class ranges:
-            lin_vel_x = [-0.6, 0.6]    # 楼梯上降速，避免高速摔倒
-            lin_vel_y = [-0.4, 0.4]    # 侧向降速
-            ang_vel_yaw = [-0.6, 0.6]  # 转向降速
+            lin_vel_x = [0.2, 0.6]     # 强制前进(最低0.2>0.1)：消除"命令≈0时不动拿满分"的偷懒，迫使机器人行走
+            lin_vel_y = [-0.2, 0.2]    # 侧向小范围
+            ang_vel_yaw = [-0.6, 0.6]  # 转向
             heading = [-3.14, 3.14]
 
     class init_state(LeggedRobotCfg.init_state):
@@ -140,7 +140,7 @@ class TinymalRoughCfg(LeggedRobotCfg):
     class rewards(LeggedRobotCfg.rewards):
         class scales(LeggedRobotCfg.rewards.scales):
             # 主要奖励（轻小机器人加强跟踪与姿态稳定）
-            tracking_lin_vel = 2.5
+            tracking_lin_vel = 4.0         # 提高：让"动起来追速度"的收益压过"站着不动"的偷懒
             tracking_ang_vel = 1.5
             # 轻机器人转动惯量小，同扰动影响更大，加强姿态稳定惩罚
             lin_vel_z = -1.5
@@ -160,7 +160,7 @@ class TinymalRoughCfg(LeggedRobotCfg):
             #   trot / gallop / energy_consumption / feet_clearance /
             #   default_hip_pos / default_pos / contact_without_command / alive
 
-        only_positive_rewards = False
+        only_positive_rewards = True   # 每步总reward裁剪≥0，避免极端负reward导致critic value_loss发散(2亿→正常)
         tracking_sigma = 0.25
         soft_dof_pos_limit = 0.95       # 高抬腿需更大关节活动范围
         soft_dof_vel_limit = 1.
@@ -232,11 +232,11 @@ class TinymalRoughCfgPPO(LeggedRobotCfgPPO):
         entropy_coef = 0.01
         num_learning_epochs = 5
         num_mini_batches = 4
-        learning_rate = 3.e-4
-        schedule = 'adaptive'
+        learning_rate = 3.e-4           # 降critic学习率防value_loss发散(1e-3下critic仍爆到2亿)
+        schedule = 'fixed'              # 固定LR，避免adaptive失控
         gamma = 0.99
         lam = 0.95
-        desired_kl = 0.01
+        desired_kl = 0.01               # fixed 模式下不生效，保留无碍
         # sym_loss / obs_permutation / act_permutation / frame_stack / sym_coef
         # 需自定义 rsl_rl 才生效，原版不读，已剔除
 
